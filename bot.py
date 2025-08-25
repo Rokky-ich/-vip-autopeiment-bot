@@ -1,4 +1,4 @@
-# bot.py (aiogram 2.25.2) — базовая версия + продление за 59 PLN
+# bot.py (aiogram 2.25.2) — база + продление 59 PLN + "уже подписан" на Zapłaciłem
 import os
 import json
 import asyncio
@@ -34,7 +34,7 @@ WEBAPP_PORT = int(os.getenv("PORT", "8000"))
 DB_FILE = "/data/subscriptions.json"  # база локальных подписок
 
 # Цены (в PLN)
-PRICE_INITIAL_PLN = 159      # твоя базовая цена (оставил как было)
+PRICE_INITIAL_PLN = 5      # базовая покупка
 PRICE_RENEW_PLN   = 59     # продление
 
 # -------- Бот/диспетчер --------
@@ -86,8 +86,7 @@ def set_pending_session(user_id: int, session_id: str, kind: str):
 
 def peek_pending_session(user_id: int):
     item = db["pending"].get(str(user_id))
-    if isinstance(item, str):
-        # совместимость на случай старого значения
+    if isinstance(item, str):  # бэкомпат
         return {"id": item, "ts": int(time.time()), "kind": "initial"}
     return item
 
@@ -95,8 +94,9 @@ def pop_pending_session(user_id: int):
     db["pending"].pop(str(user_id), None)
     save_db(db)
 
-# -------- Вспомогательное: вычислить новую дату окончания (+30 дней) --------
+# -------- Вспомогательные хелперы --------
 def extend_30_days_from_current_or_today(current_end_str: str | None) -> str:
+    """Продлевает на 30 дней от большей даты: сегодня или текущего конца."""
     today = datetime.now().date()
     base = today
     if current_end_str:
@@ -109,7 +109,24 @@ def extend_30_days_from_current_or_today(current_end_str: str | None) -> str:
     new_end = base + timedelta(days=30)
     return new_end.strftime("%Y-%m-%d")
 
-# -------- Stripe: создание сессии оплаты (любая сумма) --------
+def _parse_date(date_str: str):
+    return datetime.strptime(date_str, "%Y-%m-%d").date()
+
+def _sub_status(user_id: int):
+    """Возвращает (is_active: bool, end_date: date|None, days_left: int|None)."""
+    end_str = get_sub_end(user_id)
+    if not end_str:
+        return False, None, None
+    try:
+        end_date = _parse_date(end_str)
+    except Exception:
+        return False, None, None
+    today = datetime.now().date()
+    if end_date >= today:
+        return True, end_date, (end_date - today).days
+    return False, end_date, 0
+
+# -------- Stripe: создание сессии оплаты --------
 def _success_url():
     return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
 
@@ -235,16 +252,31 @@ async def handle_no_renew(callback: types.CallbackQuery):
 async def handle_paid(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     item = peek_pending_session(user_id)
-    session_id = item["id"] if item else None
+    session_id = item["id"] if item and isinstance(item, dict) else (item if isinstance(item, str) else None)
 
+    # текущее состояние подписки
+    is_active, end_date, days_left = _sub_status(user_id)
+
+    # если НЕТ pending-сессии
     if not session_id:
-        await callback.message.answer(
-            "Nie widzę aktywnej płatności. Najpierw użyj „💳 Link do płatności” lub „🔄 Przedłuż”.",
-            reply_markup=main_keyboard()
-        )
+        if is_active:
+            # уже подписан — сообщаем остаток и предлагаем продлить
+            text = (
+                "✅ Już masz aktywną subskrypcję.\n"
+                f"📅 Ważna do: <b>{end_date.strftime('%Y-%m-%d')}</b> "
+                f"(pozostało dni: <b>{days_left}</b>).\n\n"
+                "Chcesz przedłużyć o kolejne 30 dni?"
+            )
+            await callback.message.answer(text, reply_markup=renew_offer_keyboard())
+        else:
+            await callback.message.answer(
+                "Nie widzę aktywnej płatności. Najpierw użyj „💳 Link do płatności” lub „🔄 Przedłuż”.",
+                reply_markup=main_keyboard()
+            )
         await callback.answer()
         return
 
+    # есть pending-сессия — проверим статус в Stripe
     try:
         session = stripe.checkout.Session.retrieve(session_id)
     except Exception as e:
@@ -253,7 +285,7 @@ async def handle_paid(callback: types.CallbackQuery):
         return
 
     if session.get("status") == "complete" and session.get("payment_status") == "paid":
-        # продление/активация на 30 дней от текущей или сегодняшней даты
+        # оплата прошла — продлеваем/активируем на 30 дней от большей даты
         new_end = extend_30_days_from_current_or_today(get_sub_end(user_id))
         set_sub_end(user_id, new_end)
         pop_pending_session(user_id)
@@ -280,9 +312,19 @@ async def handle_paid(callback: types.CallbackQuery):
             )
             await callback.message.answer("⚠️ Wystąpił błąd po stronie bota. Admin został powiadomiony.")
     else:
-        await callback.message.answer(
-            "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie „✅ Zapłaciłem”."
-        )
+        # платёж ещё не подтверждён
+        if is_active:
+            await callback.message.answer(
+                "🔎 Płatność jeszcze niepotwierdzona.\n"
+                f"✅ Masz aktywną subskrypcję do <b>{end_date.strftime('%Y-%m-%d')}</b> "
+                f"(pozostało dni: <b>{days_left}</b>).\n"
+                "Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie „✅ Zapłaciłem”."
+            )
+        else:
+            await callback.message.answer(
+                "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie "
+                "„✅ Zapłaciłem”."
+            )
 
     await callback.answer()
 
