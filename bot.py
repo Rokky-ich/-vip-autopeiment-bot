@@ -1,4 +1,6 @@
-# bot.py (aiogram 2.25.2) — база + продление 59 PLN + "уже подписан" + авто-чистка невыплаченных сессий + санитарка pending
+# bot.py (aiogram 2.25.2)
+# база + продление 59 PLN + "уже подписан" + авто-чистка невыплаченных сессий + санитарка pending
+# + уведомления админу о покупках/продлениях
 import os
 import json
 import asyncio
@@ -15,7 +17,7 @@ import stripe
 API_TOKEN = os.getenv("API_TOKEN")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")          # напр.: https://your-domain.com
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1279721354"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "2119400801"))
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
@@ -34,7 +36,7 @@ WEBAPP_PORT = int(os.getenv("PORT", "8000"))
 DB_FILE = "/data/subscriptions.json"  # база локальных подписок
 
 # Цены (в PLN)
-PRICE_INITIAL_PLN = 5      # базовая покупка
+PRICE_INITIAL_PLN = 159      # базовая покупка
 PRICE_RENEW_PLN   = 59     # продление
 
 # --- Параметры санитарки pending-сессий ---
@@ -130,6 +132,38 @@ def _sub_status(user_id: int):
         return True, end_date, (end_date - today).days
     return False, end_date, 0
 
+# --- НОВОЕ: уведомления админу ---
+async def _get_user_display(user_id: int) -> str:
+    """Пытается получить удобное имя пользователя для админ-уведомления."""
+    try:
+        u = await bot.get_chat(user_id)
+        parts = []
+        if getattr(u, "full_name", None):
+            parts.append(u.full_name)
+        if getattr(u, "username", None):
+            parts.append(f"@{u.username}")
+        parts.append(f"id:{user_id}")
+        return " / ".join(parts)
+    except Exception:
+        return f"id:{user_id}"
+
+async def notify_admin_purchase(user_id: int, kind: str, new_end: str, amount_pln: int, session_id: str | None = None):
+    """Отправляет админу уведомление о покупке/продлении."""
+    user_disp = await _get_user_display(user_id)
+    title = "🆕 Покупка (initial)" if kind == "initial" else "🔄 Продление (renew)"
+    sid_line = f"\nSID: <code>{session_id}</code>" if session_id else ""
+    msg = (
+        f"{title}\n"
+        f"👤 Пользователь: {user_disp}\n"
+        f"💰 Сумма: {amount_pln} PLN\n"
+        f"📅 Новая дата окончания: <b>{new_end}</b>"
+        f"{sid_line}"
+    )
+    try:
+        await bot.send_message(ADMIN_ID, msg)
+    except Exception:
+        pass
+
 # --- НОВОЕ: аккуратная очистка старой pending-сессии перед созданием новой ---
 def expire_and_clear_pending_if_open(user_id: int):
     """
@@ -143,7 +177,6 @@ def expire_and_clear_pending_if_open(user_id: int):
         return
     try:
         session = stripe.checkout.Session.retrieve(session_id)
-        # статус может быть: open / complete / expired / etc.
         if session and session.get("status") == "open":
             try:
                 stripe.checkout.Session.expire(session_id)
@@ -253,7 +286,7 @@ async def create_checkout_session(user_id: int, amount_pln: int, product_name: s
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(row_width=1).add(
         InlineKeyboardButton("📞 Kontakt z administratorem", url="https://t.me/wawaadmin"),
-        InlineKeyboardButton("💳 Link do płatności", callback_data="pay"),
+        InlineKeyboardButton("💳 VIP na miesiąc 159zl", callback_data="pay"),
         InlineKeyboardButton("✅ Zapłaciłem", callback_data="paid"),
     )
 
@@ -285,33 +318,28 @@ async def cmd_start(message: types.Message):
             reply_markup=main_keyboard()
         )
 
-# -------- Первичная оплата / теперь с проверкой активной подписки --------
+# -------- Первичная оплата / с проверкой активной подписки --------
 @dp.callback_query_handler(lambda c: c.data == "pay")
 async def handle_payment(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    # НОВОЕ: если у пользователя активная подписка — не создаём покупку на 5 PLN,
-    # а сразу предлагаем продлить за 59 PLN, показав остаток дней.
+    # Если у пользователя активная подписка — не создаём 5 PLN, предлагаем продлить 59 PLN
     is_active, end_date, days_left = _sub_status(user_id)
     if is_active:
-        # очищаем возможную старую pending-сессию (чтобы не копилась)
         expire_and_clear_pending_if_open(user_id)
         await callback.message.answer(
             "✅ Masz już aktywną subskrypcję.\n"
-            f"📅 Ważna do: <b>{end_date.strftime('%Y-%m-%d')}</b> "
+            f"📅 Ważна до: <b>{end_date.strftime('%Y-%m-%d')}</b> "
             f"(pozostało dni: <b>{days_left}</b>).\n\n"
-            f"Chcesz przedłużyć o kolejne 30 dni za <b>{PRICE_RENEW_PLN} PLN</b>?",
+            f"Chcesz przedłużyć o kolejne 30 dni за <b>{PRICE_RENEW_PLN} PLN</b>?",
             reply_markup=renew_offer_keyboard()
         )
         await callback.answer()
         return
 
-    # Иначе — обычная первичная покупка (5 PLN)
+    # Иначе — первичная покупка (5 PLN)
     payment_url = await create_checkout_session(
-        user_id,
-        PRICE_INITIAL_PLN,
-        "Dostęp do kanału VIP",
-        kind="initial"
+        user_id, PRICE_INITIAL_PLN, "Dostęp do kanału VIP", kind="initial"
     )
     if payment_url:
         await callback.message.answer(
@@ -333,10 +361,7 @@ async def handle_payment(callback: types.CallbackQuery):
 async def handle_renew(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     payment_url = await create_checkout_session(
-        user_id,
-        PRICE_RENEW_PLN,
-        "VIP_WAWA — przedłużenie 30 dni",
-        kind="renew"
+        user_id, PRICE_RENEW_PLN, "VIP_WAWA — przedłużenie 30 dni", kind="renew"
     )
     if payment_url:
         await callback.message.answer(
@@ -358,12 +383,13 @@ async def handle_no_renew(callback: types.CallbackQuery):
     await callback.message.answer("Rozumiem. Możesz wrócić do przedłużenia w dowolnym momencie z menu.")
     await callback.answer()
 
-# -------- Ручная проверка "Zapłaciłem" --------
+# -------- Ручная проверка "Zapłaciłem" (и уведомление админу) --------
 @dp.callback_query_handler(lambda c: c.data == "paid")
 async def handle_paid(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     item = peek_pending_session(user_id)
     session_id = item["id"] if item and isinstance(item, dict) else (item if isinstance(item, str) else None)
+    kind = item.get("kind") if isinstance(item, dict) else "initial"
 
     # текущее состояние подписки
     is_active, end_date, days_left = _sub_status(user_id)
@@ -395,9 +421,16 @@ async def handle_paid(callback: types.CallbackQuery):
         return
 
     if session.get("status") == "complete" and session.get("payment_status") == "paid":
+        # сумма по факту из Stripe (если доступна), иначе от kind
+        amount_total = session.get("amount_total")
+        amount_pln = int(amount_total // 100) if isinstance(amount_total, int) else (PRICE_RENEW_PLN if kind == "renew" else PRICE_INITIAL_PLN)
+
         new_end = extend_30_days_from_current_or_today(get_sub_end(user_id))
         set_sub_end(user_id, new_end)
         pop_pending_session(user_id)
+
+        # уведомление админу
+        await notify_admin_purchase(user_id, kind, new_end, amount_pln, session_id=session.get("id"))
 
         try:
             invite = await bot.create_chat_invite_link(
@@ -421,6 +454,7 @@ async def handle_paid(callback: types.CallbackQuery):
             )
             await callback.message.answer("⚠️ Wystąpił błąd po stronie bota. Admin został powiadomiony.")
     else:
+        # платёж ещё не подтверждён — можно предложить подождать
         if is_active:
             await callback.message.answer(
                 "🔎 Płatność jeszcze niepotwierdzona.\n"
@@ -430,13 +464,13 @@ async def handle_paid(callback: types.CallbackQuery):
             )
         else:
             await callback.message.answer(
-                "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie "
+                "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i нaciśnij ponownie "
                 "„✅ Zapłaciłem”."
             )
 
     await callback.answer()
 
-# -------- Stripe webhook (автоматический путь) --------
+# -------- Stripe webhook (автоматический путь) + уведомление админу --------
 async def stripe_webhook(request: web.Request):
     payload = await request.read()
     sig_header = request.headers.get("Stripe-Signature")
@@ -449,17 +483,24 @@ async def stripe_webhook(request: web.Request):
     if event.get("type") == "checkout.session.completed":
         session = event["data"]["object"]
         user_id = session.get("metadata", {}).get("user_id")
+        kind = session.get("metadata", {}).get("kind", "initial")
         if user_id:
             user_id_int = int(user_id)
             new_end = extend_30_days_from_current_or_today(get_sub_end(user_id_int))
             set_sub_end(user_id_int, new_end)
 
+            # очистка pending при совпадении
             try:
                 item = peek_pending_session(user_id_int)
                 if item and item.get("id") == session.get("id"):
                     pop_pending_session(user_id_int)
             except Exception:
                 pass
+
+            # уведомление админу (сумма из Stripe, если есть)
+            amount_total = session.get("amount_total")
+            amount_pln = int(amount_total // 100) if isinstance(amount_total, int) else (PRICE_RENEW_PLN if kind == "renew" else PRICE_INITIAL_PLN)
+            await notify_admin_purchase(user_id_int, kind, new_end, amount_pln, session_id=session.get("id"))
 
             try:
                 invite = await bot.create_chat_invite_link(
@@ -480,7 +521,7 @@ async def stripe_webhook(request: web.Request):
             except Exception as e:
                 await bot.send_message(
                     ADMIN_ID,
-                    f"⚠️ Błąd при wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
+                    f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
                 )
 
     return web.Response(status=200)
@@ -515,7 +556,7 @@ async def check_expired():
                         await asyncio.sleep(1)
                         await bot.unban_chat_member(CHANNEL_ID, int(user_id))
                     except Exception as e:
-                        await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy usuwaniu {user_id}:\n<code>{e}</code>")
+                        await bot.send_message(ADMIN_ID, f"⚠️ Błąd при usuwaniu {user_id}:\n<code>{e}</code>")
                     to_remove.append(user_id)
 
             except Exception as e:
