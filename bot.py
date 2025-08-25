@@ -24,6 +24,9 @@ WEBHOOK_PATH = f"/webhook/{API_TOKEN}"            # путь Telegram вебху
 STRIPE_WEBHOOK_PATH = "/webhook/stripe"           # путь Stripe вебхука
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
+# 👇 НОВОЕ: username бота для редиректов из Stripe
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
+
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", "8000"))
 
@@ -59,6 +62,10 @@ subscriptions = load_subscriptions()
 # -------- Stripe: создание сессии оплаты --------
 async def create_checkout_session(user_id: int):
     try:
+        # 👇 НОВОЕ: редиректим обратно в твоего бота
+        success_url = f"https://t.me/{BOT_USERNAME}?start=success" if BOT_USERNAME else WEBHOOK_HOST
+        cancel_url  = f"https://t.me/{BOT_USERNAME}?start=cancel"  if BOT_USERNAME else WEBHOOK_HOST
+
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{
@@ -70,8 +77,8 @@ async def create_checkout_session(user_id: int):
                 "quantity": 1,
             }],
             mode="payment",
-            success_url="https://t.me/TwojBot?start=success",
-            cancel_url="https://t.me/TwojBot?start=cancel",
+            success_url=success_url,
+            cancel_url=cancel_url,
             metadata={"user_id": str(user_id)},
         )
         return session.url
@@ -132,12 +139,16 @@ async def stripe_webhook(request: web.Request):
                 kb = InlineKeyboardMarkup().add(
                     InlineKeyboardButton("🔗 Dołącz do kanału", url=invite.invite_link)
                 )
-                await bot.send_message(int(user_id),
-                                       "✅ Płatność potwierdzona! Kliknij poniżej, aby dołączyć do kanału:",
-                                       reply_markup=kb)
+                await bot.send_message(
+                    int(user_id),
+                    "✅ Płatność potwierdzona! Kliknij poniżej, aby dołączyć do kanału:",
+                    reply_markup=kb
+                )
             except Exception as e:
-                await bot.send_message(ADMIN_ID,
-                                       f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>")
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
+                )
 
     return web.Response(status=200)
 
@@ -158,8 +169,7 @@ async def check_expired():
 
                 elif end_date <= now:
                     try:
-                        await bot.send_message(int(user_id),
-                                               "❌ Twoja subskrypcja wygasła. Zostałeś usunięty z kanału.")
+                        await bot.send_message(int(user_id), "❌ Twoja subskrypcja wygasła. Zostałeś usunięty z kanału.")
                     except Exception:
                         pass
                     try:
@@ -167,13 +177,11 @@ async def check_expired():
                         await asyncio.sleep(1)
                         await bot.unban_chat_member(CHANNEL_ID, int(user_id))
                     except Exception as e:
-                        await bot.send_message(ADMIN_ID,
-                                               f"⚠️ Błąd przy usuwaniu {user_id}:\n<code>{e}</code>")
+                        await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy usuwaniu {user_id}:\n<code>{e}</code>")
                     to_remove.append(user_id)
 
             except Exception as e:
-                await bot.send_message(ADMIN_ID,
-                                       f"⚠️ Błąd przy przetwarzaniu {user_id}:\n<code>{e}</code>")
+                await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy przetwarzaniu {user_id}:\n<code>{e}</code>")
 
         for uid in to_remove:
             subscriptions.pop(uid, None)
@@ -191,7 +199,7 @@ async def telegram_webhook(request: web.Request):
 
     update = types.Update(**data)
 
-    # ВАЖНО: выставляем текущие экземпляры для контекста aiogram 2.x
+    # контекст aiogram 2.x
     Bot.set_current(bot)
     Dispatcher.set_current(dp)
 
