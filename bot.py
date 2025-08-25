@@ -7,13 +7,12 @@ from datetime import datetime, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.executor import get_new_configured_app
 
 import stripe
 
-# ---------- Конфиг из окружения ----------
+# ---------- Конфиг ----------
 API_TOKEN = os.getenv("API_TOKEN")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")  # например: https://your-domain.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")                 # напр.: https://your-domain.com
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1279721354"))
 
@@ -21,16 +20,16 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 stripe.api_key = STRIPE_SECRET_KEY
 
-WEBHOOK_PATH = f"/webhook/{API_TOKEN}"        # путь для Telegram вебхука
-STRIPE_WEBHOOK_PATH = "/webhook/stripe"       # путь для Stripe вебхука
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}" # полный URL для setWebhook
+WEBHOOK_PATH = f"/webhook/{API_TOKEN}"                   # путь TG вебхука
+STRIPE_WEBHOOK_PATH = "/webhook/stripe"                  # путь Stripe вебхука
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", "8000"))
 
 DB_FILE = "/data/subscriptions.json"
 
-# ---------- Инициализация бота/диспетчера ----------
+# ---------- Бот / диспетчер ----------
 bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot)
 
@@ -57,7 +56,7 @@ def save_subscriptions(data: dict):
 
 subscriptions = load_subscriptions()
 
-# ---------- Stripe: создание сессии оплаты ----------
+# ---------- Stripe: создание checkout session ----------
 async def create_checkout_session(user_id: int):
     try:
         session = stripe.checkout.Session.create(
@@ -80,7 +79,7 @@ async def create_checkout_session(user_id: int):
         print(f"[Stripe] create_checkout_session error: {e}")
         return None
 
-# ---------- Команды ----------
+# ---------- Хэндлеры команд ----------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     keyboard = InlineKeyboardMarkup(row_width=1).add(
@@ -89,7 +88,7 @@ async def cmd_start(message: types.Message):
     )
     await message.answer("👋 Cześć! Kliknij przycisk poniżej, aby uzyskać dostęp:", reply_markup=keyboard)
 
-# ---------- Обработка нажатий ----------
+# ---------- Callback: оплата ----------
 @dp.callback_query_handler(lambda c: c.data == "pay")
 async def handle_payment(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -105,7 +104,7 @@ async def handle_payment(callback: types.CallbackQuery):
         await callback.message.answer("❌ Błąd podczas generowania linku do płatności.")
     await callback.answer()
 
-# ---------- Stripe вебхук ----------
+# ---------- Stripe webhook ----------
 async def stripe_webhook(request: web.Request):
     payload = await request.read()
     sig_header = request.headers.get("Stripe-Signature")
@@ -120,7 +119,6 @@ async def stripe_webhook(request: web.Request):
         user_id = session.get("metadata", {}).get("user_id")
 
         if user_id:
-            # 30 дней подписки
             end_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
             subscriptions[user_id] = end_date
             save_subscriptions(subscriptions)
@@ -131,11 +129,23 @@ async def stripe_webhook(request: web.Request):
                     expire_date=int((datetime.now() + timedelta(days=1)).timestamp()),
                     member_limit=1
                 )
-                kb = InlineKeyboardMarkup().add(InlineKeyboardButton("🔗 Dołącz do kanału", url=invite.invite_link))
+                kb = InlineKeyboardMarkup().add(
+                    InlineKeyboardButton("🔗 Dołącz do kanału", url=invite.invite_link)
+                )
                 await bot.send_message(int(user_id), "✅ Płatność potwierdzona! Kliknij poniżej, aby dołączyć do kanału:", reply_markup=kb)
             except Exception as e:
                 await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>")
 
+    return web.Response(status=200)
+
+# ---------- Telegram webhook (aiohttp маршрут) ----------
+async def telegram_webhook(request: web.Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400)
+    update = types.Update.to_object(data)
+    await dp.process_updates([update])
     return web.Response(status=200)
 
 # ---------- Периодическая проверка окончаний подписок ----------
