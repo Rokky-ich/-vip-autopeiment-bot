@@ -1,4 +1,4 @@
-# bot.py (aiogram 2.25.2) — с кнопкой "Zapłaciłem" и ручной проверкой Stripe
+# bot.py (aiogram 2.25.2) — с кнопкой "Zapłaciłem", тихим редиректом и ручной проверкой Stripe
 import os
 import json
 import asyncio
@@ -30,7 +30,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", "8000"))
 
-DB_FILE = "/data/subscriptions.json"  # в исходнике ты уже использовал этот путь :contentReference[oaicite:0]{index=0}
+DB_FILE = "/data/subscriptions.json"
 
 # -------- Бот/диспетчер --------
 bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
@@ -44,7 +44,7 @@ def _ensure_data_dir():
 
 def _empty_db():
     # subs: { user_id(str): "YYYY-MM-DD" }
-    # pending: { user_id(str): "cs_test_..." }
+    # pending: { user_id(str): "cs_..." или {"id": "...", "ts": ...} }
     return {"subs": {}, "pending": {}}
 
 def load_db():
@@ -56,15 +56,9 @@ def load_db():
             data = json.load(f)
     except Exception:
         return _empty_db()
-
-    # миграция: если был старый формат {user_id: "date"}
     if isinstance(data, dict) and "subs" not in data and "pending" not in data:
         return {"subs": data, "pending": {}}
-    # нормализуем
-    return {
-        "subs": dict(data.get("subs", {})),
-        "pending": dict(data.get("pending", {})),
-    }
+    return {"subs": dict(data.get("subs", {})), "pending": dict(data.get("pending", {}))}
 
 def save_db(data: dict):
     _ensure_data_dir()
@@ -93,8 +87,9 @@ def peek_pending_session(user_id: int):
 # -------- Stripe: создание сессии оплаты --------
 async def create_checkout_session(user_id: int):
     try:
-        success_url = f"https://t.me/{BOT_USERNAME}  if BOT_USERNAME else WEBHOOK_HOST
-        cancel_url  = f"https://t.me/{BOT_USERNAME}  if BOT_USERNAME else WEBHOOK_HOST
+        # ТИХИЙ редирект в чат бота (без /start и параметров)
+        success_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
+        cancel_url  = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
 
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -102,7 +97,7 @@ async def create_checkout_session(user_id: int):
                 "price_data": {
                     "currency": "pln",
                     "product_data": {"name": "Dostęp do kanału VIP"},
-                    "unit_amount": 500,  # 5 PLN — как в исходнике :contentReference[oaicite:1]{index=1}
+                    "unit_amount": 500,  # 5 PLN
                 },
                 "quantity": 1,
             }],
@@ -130,12 +125,11 @@ def main_keyboard() -> InlineKeyboardMarkup:
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    # проверяем, есть ли "pending" платеж
     item = peek_pending_session(user_id)
     if item:
         await message.answer(
             "👋 Cześć! Widzę, że masz rozpoczętą płatność.\n"
-            "Jeśli już opłaciłeś, naciśnij przycisk poniżej:",
+            "Jeśli już opłaciłeś, naciśnij „✅ Zapłaciłem”.",
             reply_markup=main_keyboard()
         )
     else:
@@ -184,12 +178,9 @@ async def handle_paid(callback: types.CallbackQuery):
         return
 
     if session.get("status") == "complete" and session.get("payment_status") == "paid":
-        # оформляем подписку и отправляем инвайт
         end_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
         set_sub_end(user_id, end_date)
-        # убираем pending сессию
         pop_pending_session(user_id)
-
         try:
             invite = await bot.create_chat_invite_link(
                 chat_id=CHANNEL_ID,
@@ -229,13 +220,11 @@ async def stripe_webhook(request: web.Request):
         if user_id:
             end_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
             set_sub_end(int(user_id), end_date)
-            # если была pending-сессия — очищаем
             try:
                 if peek_pending_session(int(user_id)) == session.get("id"):
                     pop_pending_session(int(user_id))
             except Exception:
                 pass
-
             try:
                 invite = await bot.create_chat_invite_link(
                     chat_id=CHANNEL_ID,
