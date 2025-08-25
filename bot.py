@@ -1,6 +1,6 @@
 # bot.py (aiogram 2.25.2)
 # база + продление 59 PLN + "уже подписан" + авто-чистка pending + санитарка pending
-# + уведомления админу + кнопка ▶️ Start (вместо ручного /start)
+# + уведомления админу (без лишней кнопки ▶️ Start)
 import os
 import json
 import asyncio
@@ -36,7 +36,7 @@ WEBAPP_PORT = int(os.getenv("PORT", "8000"))
 DB_FILE = "/data/subscriptions.json"  # база локальных подписок
 
 # Цены (в PLN)
-PRICE_INITIAL_PLN = int(os.getenv("PRICE_INITIAL_PLN", "159"))  # базовая покупка (актуальная база)
+PRICE_INITIAL_PLN = int(os.getenv("PRICE_INITIAL_PLN", "159"))  # базовая покупка
 PRICE_RENEW_PLN   = int(os.getenv("PRICE_RENEW_PLN", "59"))     # продление
 
 # --- Параметры санитарки pending-сессий ---
@@ -47,7 +47,7 @@ PENDING_SWEEP_SEC  = int(os.getenv("PENDING_SWEEP_SEC", "300")) # 5 мин
 bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot)
 
-# -------- Утилиты БД (совм. со старым форматом) --------
+# -------- Утилиты БД --------
 def _ensure_data_dir():
     d = os.path.dirname(DB_FILE)
     if d and not os.path.exists(d):
@@ -134,7 +134,6 @@ def _sub_status(user_id: int):
 
 # --- Уведомления админу ---
 async def _get_user_display(user_id: int) -> str:
-    """Пытается получить удобное имя пользователя для админ-уведомления."""
     try:
         u = await bot.get_chat(user_id)
         parts = []
@@ -148,7 +147,6 @@ async def _get_user_display(user_id: int) -> str:
         return f"id:{user_id}"
 
 async def notify_admin_purchase(user_id: int, kind: str, new_end: str, amount_pln: int, session_id: str | None = None):
-    """Отправляет админу уведомление о покупке/продлении."""
     user_disp = await _get_user_display(user_id)
     title = "🆕 Покупка (initial)" if kind == "initial" else "🔄 Продление (renew)"
     sid_line = f"\nSID: <code>{session_id}</code>" if session_id else ""
@@ -166,11 +164,6 @@ async def notify_admin_purchase(user_id: int, kind: str, new_end: str, amount_pl
 
 # --- Аккуратная очистка старой pending-сессии перед созданием новой ---
 def expire_and_clear_pending_if_open(user_id: int):
-    """
-    Если у пользователя есть старая pending-сессия Checkout:
-      - если она OPEN, делаем stripe.checkout.Session.expire(session_id)
-      - удаляем её из базы в любом случае (чтобы не копились хвосты)
-    """
     item = peek_pending_session(user_id)
     session_id = item["id"] if item else None
     if not session_id:
@@ -188,11 +181,6 @@ def expire_and_clear_pending_if_open(user_id: int):
 
 # --- Фоновая санитарка pending-сессий ---
 async def sanitize_pending_loop():
-    """
-    Фоновая уборка незавершённых checkout-сессий.
-    - Удаляет из pending те, что старше PENDING_TTL_SEC (и пытается expire, если они всё ещё open).
-    - Также удаляет те, которые уже complete/expired, чтобы не копились.
-    """
     while True:
         now_ts = int(time.time())
         to_delete = []
@@ -251,6 +239,7 @@ async def sanitize_pending_loop():
 
 # -------- Stripe: создание сессии оплаты --------
 def _success_url():
+    # Тихий редирект в чат бота — Telegram сам покажет системную кнопку Start
     return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
 
 def _cancel_url():
@@ -258,16 +247,14 @@ def _cancel_url():
 
 async def create_checkout_session(user_id: int, amount_pln: int, product_name: str, kind: str):
     try:
-        # перед созданием новой сессии — закрываем и чистим старую, если она была
         expire_and_clear_pending_if_open(user_id)
-
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{
                 "price_data": {
                     "currency": "pln",
                     "product_data": {"name": product_name},
-                    "unit_amount": amount_pln * 100,  # PLN -> grosz
+                    "unit_amount": amount_pln * 100,
                 },
                 "quantity": 1,
             }],
@@ -285,7 +272,6 @@ async def create_checkout_session(user_id: int, amount_pln: int, product_name: s
 # -------- Клавиатуры --------
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(row_width=1).add(
-        InlineKeyboardButton("▶️ Start", callback_data="start_btn"),                    # НОВОЕ
         InlineKeyboardButton("📞 Kontakt z administratorem", url="https://t.me/wawaadmin"),
         InlineKeyboardButton("💳 VIP na miesiąc 159zl", callback_data="pay"),
         InlineKeyboardButton("✅ Zapłaciłem", callback_data="paid"),
@@ -302,7 +288,7 @@ def paid_inline_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Zapłaciłem", callback_data="paid")
     )
 
-# -------- Команды и кнопка Start --------
+# -------- Команда /start --------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -319,29 +305,12 @@ async def cmd_start(message: types.Message):
             reply_markup=main_keyboard()
         )
 
-@dp.callback_query_handler(lambda c: c.data == "start_btn")  # НОВОЕ
-async def handle_start_btn(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    item = peek_pending_session(user_id)
-    if item:
-        await callback.message.answer(
-            "👋 Cześć! Widzę, że masz rozpoczętą płatność.\n"
-            "Jeśli już opłaciłeś, naciśnij „✅ Zapłaciłem”.",
-            reply_markup=main_keyboard()
-        )
-    else:
-        await callback.message.answer(
-            "👋 Cześć! Kliknij przyciski poniżej:",
-            reply_markup=main_keyboard()
-        )
-    await callback.answer()
-
 # -------- Первичная оплата / с проверкой активной подписки --------
 @dp.callback_query_handler(lambda c: c.data == "pay")
 async def handle_payment(callback: types.CallbackQuery):
     user_id = callback.from_user.id
 
-    # Если у пользователя активная подписка — не создаём 159 PLN, предлагаем продлить 59 PLN
+    # Если у пользователя активная подписка — не создаём первичную, предлагаем продлить
     is_active, end_date, days_left = _sub_status(user_id)
     if is_active:
         expire_and_clear_pending_if_open(user_id)
@@ -355,7 +324,6 @@ async def handle_payment(callback: types.CallbackQuery):
         await callback.answer()
         return
 
-    # Иначе — первичная покупка (159 PLN)
     payment_url = await create_checkout_session(
         user_id, PRICE_INITIAL_PLN, "Dostęp do kanału VIP", kind="initial"
     )
@@ -409,10 +377,8 @@ async def handle_paid(callback: types.CallbackQuery):
     session_id = item["id"] if item and isinstance(item, dict) else (item if isinstance(item, str) else None)
     kind = item.get("kind") if isinstance(item, dict) else "initial"
 
-    # текущее состояние подписки
     is_active, end_date, days_left = _sub_status(user_id)
 
-    # если НЕТ pending-сессии
     if not session_id:
         if is_active:
             text = (
@@ -424,13 +390,12 @@ async def handle_paid(callback: types.CallbackQuery):
             await callback.message.answer(text, reply_markup=renew_offer_keyboard())
         else:
             await callback.message.answer(
-                "Nie widzę aktywnej płatności. Najpierw użyj „💳 Link do płatności” lub „🔄 Przedłuż”.",
+                "Nie widzę aktywnej płatności. Najpierw użyj „💳 VIP na miesiąc 159zl” lub „🔄 Przedłuż”.",
                 reply_markup=main_keyboard()
             )
         await callback.answer()
         return
 
-    # есть pending-сессия — проверим статус в Stripe
     try:
         session = stripe.checkout.Session.retrieve(session_id)
     except Exception as e:
@@ -446,7 +411,6 @@ async def handle_paid(callback: types.CallbackQuery):
         set_sub_end(user_id, new_end)
         pop_pending_session(user_id)
 
-        # уведомление админу
         await notify_admin_purchase(user_id, kind, new_end, amount_pln, session_id=session.get("id"))
 
         try:
@@ -469,7 +433,7 @@ async def handle_paid(callback: types.CallbackQuery):
                 ADMIN_ID,
                 f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
             )
-            await callback.message.answer("⚠️ Wystąpił błąd po stronie bota. Admin został powiadomiony.")
+            await callback.message.answer("⚠️ Wystąpił błąd po stronie бота. Admin został powiadomiony.")
     else:
         if is_active:
             await callback.message.answer(
@@ -505,7 +469,6 @@ async def stripe_webhook(request: web.Request):
             new_end = extend_30_days_from_current_or_today(get_sub_end(user_id_int))
             set_sub_end(user_id_int, new_end)
 
-            # очистка pending при совпадении
             try:
                 item = peek_pending_session(user_id_int)
                 if item and item.get("id") == session.get("id"):
@@ -513,7 +476,6 @@ async def stripe_webhook(request: web.Request):
             except Exception:
                 pass
 
-            # уведомление админу (сумма из Stripe, если есть)
             amount_total = session.get("amount_total")
             amount_pln = int(amount_total // 100) if isinstance(amount_total, int) else (PRICE_RENEW_PLN if kind == "renew" else PRICE_INITIAL_PLN)
             await notify_admin_purchase(user_id_int, kind, new_end, amount_pln, session_id=session.get("id"))
@@ -529,8 +491,8 @@ async def stripe_webhook(request: web.Request):
                 )
                 await bot.send_message(
                     user_id_int,
-                    "✅ Płatność потwierdzona! Twoja subskrypcja została przedłużona o 30 dni.\n"
-                    f"📅 Nowa data końca: <b>{new_end}</b>\n"
+                    "✅ Płatność potwierdzona! Twoja subskrypcja została przedłużona o 30 dni.\n"
+                    f"📅 Nowa дата końca: <b>{new_end}</b>\n"
                     "Kliknij, aby dołączyć:",
                     reply_markup=kb
                 )
@@ -576,7 +538,7 @@ async def check_expired():
                     to_remove.append(user_id)
 
             except Exception as e:
-                await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy przetwarzaniu {user_id}:\n<code>{e}</code>")
+                await bot.send_message(ADMIN_ID, f"⚠️ Błąd при przetwarzaniu {user_id}:\n<code>{e}</code>")
 
         for uid in to_remove:
             db["subs"].pop(uid, None)
@@ -604,7 +566,7 @@ async def telegram_webhook(request: web.Request):
 async def on_startup_app(app: web.Application):
     await bot.set_webhook(WEBHOOK_URL)
     asyncio.create_task(check_expired())
-    asyncio.create_task(sanitize_pending_loop())  # запуск санитарки
+    asyncio.create_task(sanitize_pending_loop())
 
 async def on_shutdown_app(app: web.Application):
     await bot.delete_webhook()
