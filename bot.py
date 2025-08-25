@@ -1,4 +1,4 @@
-# bot.py (aiogram 2.25.2) — база + продление 59 PLN + "уже подписан" на Zapłaciłem
+# bot.py (aiogram 2.25.2) — база + продление 59 PLN + "уже подписан" + авто-чистка невыплаченных сессий + санитарка pending
 import os
 import json
 import asyncio
@@ -36,6 +36,10 @@ DB_FILE = "/data/subscriptions.json"  # база локальных подпис
 # Цены (в PLN)
 PRICE_INITIAL_PLN = 5      # базовая покупка
 PRICE_RENEW_PLN   = 59     # продление
+
+# --- Параметры санитарки pending-сессий ---
+PENDING_TTL_SEC    = int(os.getenv("PENDING_TTL_SEC", "1800"))  # 30 мин
+PENDING_SWEEP_SEC  = int(os.getenv("PENDING_SWEEP_SEC", "300")) # 5 мин
 
 # -------- Бот/диспетчер --------
 bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
@@ -126,6 +130,100 @@ def _sub_status(user_id: int):
         return True, end_date, (end_date - today).days
     return False, end_date, 0
 
+# --- НОВОЕ: аккуратная очистка старой pending-сессии перед созданием новой ---
+def expire_and_clear_pending_if_open(user_id: int):
+    """
+    Если у пользователя есть старая pending-сессия Checkout:
+      - если она OPEN, делаем stripe.checkout.Session.expire(session_id)
+      - удаляем её из базы в любом случае (чтобы не копились хвосты)
+    """
+    item = peek_pending_session(user_id)
+    session_id = item["id"] if item else None
+    if not session_id:
+        return
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+        # статус может быть: open / complete / expired / etc.
+        if session and session.get("status") == "open":
+            try:
+                stripe.checkout.Session.expire(session_id)
+            except Exception:
+                # даже если не удалось вызвать expire — просто очистим pending
+                pass
+    except Exception:
+        # не смогли получить/проверить — тоже чистим pending
+        pass
+    # в любом случае больше не держим старую pending
+    pop_pending_session(user_id)
+
+# --- НОВОЕ: фоновая санитарка pending-сессий ---
+async def sanitize_pending_loop():
+    """
+    Фоновая уборка незавершённых checkout-сессий.
+    - Удаляет из pending те, что старше PENDING_TTL_SEC (и пытается expire, если они всё ещё open).
+    - Также удаляет те, которые уже complete/expired, чтобы не копились.
+    """
+    while True:
+        now_ts = int(time.time())
+        to_delete = []
+
+        for uid, item in list(db["pending"].items()):
+            try:
+                # Бэкомпат со старым форматом
+                if isinstance(item, str):
+                    item = {"id": item, "ts": now_ts, "kind": "initial"}
+
+                sid = item.get("id")
+                ts  = int(item.get("ts", now_ts))
+
+                if not sid:
+                    to_delete.append(uid)
+                    continue
+
+                # Узнаём текущий статус сессии
+                sess = None
+                try:
+                    sess = stripe.checkout.Session.retrieve(sid)
+                except Exception:
+                    pass
+
+                # Уже завершена/истекла — удаляем
+                if sess and sess.get("status") in ("complete", "expired"):
+                    to_delete.append(uid)
+                    continue
+
+                # Слишком старая — истекаем (если open) и удаляем
+                age = now_ts - ts
+                if age >= PENDING_TTL_SEC:
+                    try:
+                        if sess is None:
+                            sess = stripe.checkout.Session.retrieve(sid)
+                    except Exception:
+                        sess = None
+                    try:
+                        if sess and sess.get("status") == "open":
+                            stripe.checkout.Session.expire(sid)
+                    except Exception:
+                        pass
+                    to_delete.append(uid)
+
+            except Exception as e:
+                # лог ошибок санитарки — не даём циклу упасть
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ sanitize_pending error for {uid}: <code>{e}</code>"
+                    )
+                except Exception:
+                    pass
+
+        if to_delete:
+            for uid in to_delete:
+                db["pending"].pop(uid, None)
+            save_db(db)
+
+        await asyncio.sleep(PENDING_SWEEP_SEC)
+
 # -------- Stripe: создание сессии оплаты --------
 def _success_url():
     return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
@@ -135,6 +233,9 @@ def _cancel_url():
 
 async def create_checkout_session(user_id: int, amount_pln: int, product_name: str, kind: str):
     try:
+        # перед созданием новой сессии — закрываем и чистим старую, если она была
+        expire_and_clear_pending_if_open(user_id)
+
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{
@@ -239,7 +340,7 @@ async def handle_renew(callback: types.CallbackQuery):
             reply_markup=paid_inline_keyboard()
         )
     else:
-        await callback.message.answer("❌ Nie udało się wygenerować linku do przedłużenia.")
+        await callback.message.answer("❌ Nie udało się wygenerować linkу do przedłużenia.")
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "norenew")
@@ -312,7 +413,7 @@ async def handle_paid(callback: types.CallbackQuery):
             )
             await callback.message.answer("⚠️ Wystąpił błąd po stronie bota. Admin został powiadomiony.")
     else:
-        # платёж ещё не подтверждён
+        # платёж ещё не подтверждён — можно предложить подождать
         if is_active:
             await callback.message.answer(
                 "🔎 Płatność jeszcze niepotwierdzona.\n"
@@ -322,7 +423,7 @@ async def handle_paid(callback: types.CallbackQuery):
             )
         else:
             await callback.message.answer(
-                "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie "
+                "🔎 Płatność jeszcze неpotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie "
                 "„✅ Zapłaciłem”."
             )
 
@@ -443,6 +544,7 @@ async def telegram_webhook(request: web.Request):
 async def on_startup_app(app: web.Application):
     await bot.set_webhook(WEBHOOK_URL)
     asyncio.create_task(check_expired())
+    asyncio.create_task(sanitize_pending_loop())  # запуск санитарки
 
 async def on_shutdown_app(app: web.Application):
     await bot.delete_webhook()
