@@ -148,12 +148,9 @@ def expire_and_clear_pending_if_open(user_id: int):
             try:
                 stripe.checkout.Session.expire(session_id)
             except Exception:
-                # даже если не удалось вызвать expire — просто очистим pending
                 pass
     except Exception:
-        # не смогли получить/проверить — тоже чистим pending
         pass
-    # в любом случае больше не держим старую pending
     pop_pending_session(user_id)
 
 # --- НОВОЕ: фоновая санитарка pending-сессий ---
@@ -169,7 +166,6 @@ async def sanitize_pending_loop():
 
         for uid, item in list(db["pending"].items()):
             try:
-                # Бэкомпат со старым форматом
                 if isinstance(item, str):
                     item = {"id": item, "ts": now_ts, "kind": "initial"}
 
@@ -180,19 +176,16 @@ async def sanitize_pending_loop():
                     to_delete.append(uid)
                     continue
 
-                # Узнаём текущий статус сессии
                 sess = None
                 try:
                     sess = stripe.checkout.Session.retrieve(sid)
                 except Exception:
                     pass
 
-                # Уже завершена/истекла — удаляем
                 if sess and sess.get("status") in ("complete", "expired"):
                     to_delete.append(uid)
                     continue
 
-                # Слишком старая — истекаем (если open) и удаляем
                 age = now_ts - ts
                 if age >= PENDING_TTL_SEC:
                     try:
@@ -208,7 +201,6 @@ async def sanitize_pending_loop():
                     to_delete.append(uid)
 
             except Exception as e:
-                # лог ошибок санитарки — не даём циклу упасть
                 try:
                     await bot.send_message(
                         ADMIN_ID,
@@ -293,10 +285,28 @@ async def cmd_start(message: types.Message):
             reply_markup=main_keyboard()
         )
 
-# -------- Первичная оплата --------
+# -------- Первичная оплата / теперь с проверкой активной подписки --------
 @dp.callback_query_handler(lambda c: c.data == "pay")
 async def handle_payment(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+
+    # НОВОЕ: если у пользователя активная подписка — не создаём покупку на 5 PLN,
+    # а сразу предлагаем продлить за 59 PLN, показав остаток дней.
+    is_active, end_date, days_left = _sub_status(user_id)
+    if is_active:
+        # очищаем возможную старую pending-сессию (чтобы не копилась)
+        expire_and_clear_pending_if_open(user_id)
+        await callback.message.answer(
+            "✅ Masz już aktywną subskrypcję.\n"
+            f"📅 Ważna do: <b>{end_date.strftime('%Y-%m-%d')}</b> "
+            f"(pozostało dni: <b>{days_left}</b>).\n\n"
+            f"Chcesz przedłużyć o kolejne 30 dni za <b>{PRICE_RENEW_PLN} PLN</b>?",
+            reply_markup=renew_offer_keyboard()
+        )
+        await callback.answer()
+        return
+
+    # Иначе — обычная первичная покупка (5 PLN)
     payment_url = await create_checkout_session(
         user_id,
         PRICE_INITIAL_PLN,
@@ -340,7 +350,7 @@ async def handle_renew(callback: types.CallbackQuery):
             reply_markup=paid_inline_keyboard()
         )
     else:
-        await callback.message.answer("❌ Nie udało się wygenerować linkу do przedłużenia.")
+        await callback.message.answer("❌ Nie udało się wygenerować linku do przedłużenia.")
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "norenew")
@@ -361,7 +371,6 @@ async def handle_paid(callback: types.CallbackQuery):
     # если НЕТ pending-сессии
     if not session_id:
         if is_active:
-            # уже подписан — сообщаем остаток и предлагаем продлить
             text = (
                 "✅ Już masz aktywną subskrypcję.\n"
                 f"📅 Ważna do: <b>{end_date.strftime('%Y-%m-%d')}</b> "
@@ -386,7 +395,6 @@ async def handle_paid(callback: types.CallbackQuery):
         return
 
     if session.get("status") == "complete" and session.get("payment_status") == "paid":
-        # оплата прошла — продлеваем/активируем на 30 дней от большей даты
         new_end = extend_30_days_from_current_or_today(get_sub_end(user_id))
         set_sub_end(user_id, new_end)
         pop_pending_session(user_id)
@@ -413,7 +421,6 @@ async def handle_paid(callback: types.CallbackQuery):
             )
             await callback.message.answer("⚠️ Wystąpił błąd po stronie bota. Admin został powiadomiony.")
     else:
-        # платёж ещё не подтверждён — можно предложить подождать
         if is_active:
             await callback.message.answer(
                 "🔎 Płatność jeszcze niepotwierdzona.\n"
@@ -423,7 +430,7 @@ async def handle_paid(callback: types.CallbackQuery):
             )
         else:
             await callback.message.answer(
-                "🔎 Płatność jeszcze неpotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie "
+                "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie "
                 "„✅ Zapłaciłem”."
             )
 
@@ -444,11 +451,9 @@ async def stripe_webhook(request: web.Request):
         user_id = session.get("metadata", {}).get("user_id")
         if user_id:
             user_id_int = int(user_id)
-            # продлеваем от текущей даты окончания или от сегодня
             new_end = extend_30_days_from_current_or_today(get_sub_end(user_id_int))
             set_sub_end(user_id_int, new_end)
 
-            # если pending совпадает — чистим
             try:
                 item = peek_pending_session(user_id_int)
                 if item and item.get("id") == session.get("id"):
@@ -475,7 +480,7 @@ async def stripe_webhook(request: web.Request):
             except Exception as e:
                 await bot.send_message(
                     ADMIN_ID,
-                    f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
+                    f"⚠️ Błąd при wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
                 )
 
     return web.Response(status=200)
@@ -491,7 +496,6 @@ async def check_expired():
             try:
                 end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
 
-                # Напоминание за день до конца (с кнопками продления)
                 if end_date == now + timedelta(days=1) and user_id not in already_notified:
                     await bot.send_message(
                         int(user_id),
@@ -501,7 +505,6 @@ async def check_expired():
                     )
                     already_notified.add(user_id)
 
-                # Истёк срок — сообщение + удаление
                 elif end_date <= now:
                     try:
                         await bot.send_message(int(user_id), "❌ Twoja subskrypcja wygasła. Zostałeś usunięty z kanału.")
