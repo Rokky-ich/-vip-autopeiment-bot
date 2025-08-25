@@ -93,8 +93,8 @@ def peek_pending_session(user_id: int):
 # -------- Stripe: создание сессии оплаты --------
 async def create_checkout_session(user_id: int):
     try:
-        success_url = f"https://t.me/{BOT_USERNAME}?start=success" if BOT_USERNAME else WEBHOOK_HOST
-        cancel_url  = f"https://t.me/{BOT_USERNAME}?start=cancel"  if BOT_USERNAME else WEBHOOK_HOST
+        success_url = f"https://t.me/{BOT_USERNAME}  if BOT_USERNAME else WEBHOOK_HOST
+        cancel_url  = f"https://t.me/{BOT_USERNAME}  if BOT_USERNAME else WEBHOOK_HOST
 
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -129,7 +129,20 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    await message.answer("👋 Cześć! Kliknij przyciski poniżej:", reply_markup=main_keyboard())
+    user_id = message.from_user.id
+    # проверяем, есть ли "pending" платеж
+    item = peek_pending_session(user_id)
+    if item:
+        await message.answer(
+            "👋 Cześć! Widzę, że masz rozpoczętą płatność.\n"
+            "Jeśli już opłaciłeś, naciśnij przycisk poniżej:",
+            reply_markup=main_keyboard()
+        )
+    else:
+        await message.answer(
+            "👋 Cześć! Kliknij przyciski poniżej:",
+            reply_markup=main_keyboard()
+        )
 
 @dp.callback_query_handler(lambda c: c.data == "pay")
 async def handle_payment(callback: types.CallbackQuery):
