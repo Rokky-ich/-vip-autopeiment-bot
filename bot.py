@@ -1,6 +1,6 @@
 # bot.py (aiogram 2.25.2)
 # база + продление 59 PLN + "уже подписан" + авто-чистка pending + санитарка pending
-# + уведомления админу (без лишней кнопки ▶️ Start)
+# + уведомления админу + постоянная клавиатура с кнопкой /start
 import os
 import json
 import asyncio
@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton  # 👈 добавили
 
 import stripe
 
@@ -270,6 +271,12 @@ async def create_checkout_session(user_id: int, amount_pln: int, product_name: s
         return None
 
 # -------- Клавиатуры --------
+def reply_persistent_kb() -> ReplyKeyboardMarkup:
+    """Постоянная клавиатура внизу чата: кнопка отправляет /start за один тап."""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
+    kb.add(KeyboardButton("/start"))
+    return kb
+
 def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(row_width=1).add(
         InlineKeyboardButton("📞 Kontakt z administratorem", url="https://t.me/wawaadmin"),
@@ -297,11 +304,19 @@ async def cmd_start(message: types.Message):
         await message.answer(
             "👋 Cześć! Widzę, że masz rozpoczętą płatność.\n"
             "Jeśli już opłaciłeś, naciśnij „✅ Zapłaciłem”.",
+            reply_markup=reply_persistent_kb()  # 👈 устанавливаем постоянную клавиатуру
+        )
+        await message.answer(
+            "👇 Wybierz działanie:",
             reply_markup=main_keyboard()
         )
     else:
         await message.answer(
             "👋 Cześć! Kliknij przyciski poniżej:",
+            reply_markup=reply_persistent_kb()  # 👈 устанавливаем постоянную клавиатуру
+        )
+        await message.answer(
+            "👇 Menu:",
             reply_markup=main_keyboard()
         )
 
@@ -424,7 +439,7 @@ async def handle_paid(callback: types.CallbackQuery):
             )
             await callback.message.answer(
                 "✅ Płatność potwierdzona! Twoja subskrypcja została przedłużona o 30 dni.\n"
-                f"📅 Nowa data końca: <b>{new_end}</b>\n"
+                f"📅 Nowa дата końca: <b>{new_end}</b>\n"
                 "Kliknij, aby dołączyć:",
                 reply_markup=kb
             )
@@ -433,18 +448,18 @@ async def handle_paid(callback: types.CallbackQuery):
                 ADMIN_ID,
                 f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
             )
-            await callback.message.answer("⚠️ Wystąpił błąd po stronie бота. Admin został powiadomiony.")
+            await callback.message.answer("⚠️ Wystąpił błąd po stronie bота. Admin został powiadomiony.")
     else:
         if is_active:
             await callback.message.answer(
                 "🔎 Płatność jeszcze niepotwierdzona.\n"
                 f"✅ Masz aktywną subskrypcję do <b>{end_date.strftime('%Y-%m-%d')}</b> "
                 f"(pozostało dni: <b>{days_left}</b>).\n"
-                "Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie „✅ Zapłaciłem”."
+                "Jeśli zapłaciłeś, odczekaj chwilę i нaciśnij ponownie „✅ Zapłaciłem”."
             )
         else:
             await callback.message.answer(
-                "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę i naciśnij ponownie "
+                "🔎 Płatność jeszcze niepotwierdzona. Jeśli zapłaciłeś, odczekaj chwilę и нaciśnij ponownie "
                 "„✅ Zapłaciłem”."
             )
 
