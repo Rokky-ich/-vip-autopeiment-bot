@@ -182,7 +182,7 @@ async def check_expired():
         await asyncio.sleep(86400)
         already_notified.clear()
 
-# -------- Telegram вебхук-хендлер (без get_new_configured_app) --------
+# -------- Telegram вебхук-хендлер --------
 async def telegram_webhook(request: web.Request):
     try:
         data = await request.json()
@@ -191,8 +191,8 @@ async def telegram_webhook(request: web.Request):
 
     update = types.Update(**data)
 
-    # Связываем текущие Bot/Dispatcher с контекстом
-    types.base.Bot.set_current(bot)       # aiogram 2.x хак для контекста
+    # ВАЖНО: выставляем текущие экземпляры для контекста aiogram 2.x
+    Bot.set_current(bot)
     Dispatcher.set_current(dp)
 
     await dp.process_update(update)
@@ -209,15 +209,11 @@ async def on_shutdown_app(app: web.Application):
 # -------- Точка входа --------
 def build_app() -> web.Application:
     app = web.Application()
-    # Telegram webhook
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
-    # Stripe webhook
     app.router.add_post(STRIPE_WEBHOOK_PATH, stripe_webhook)
-    # Healthcheck
     async def health(request):
         return web.Response(text="OK")
     app.router.add_get("/health", health)
-
     app.on_startup.append(on_startup_app)
     app.on_shutdown.append(on_shutdown_app)
     return app
