@@ -1,7 +1,8 @@
-# bot.py (aiogram 2.25.2) — с кнопкой "Zapłaciłem", тихим редиректом и ручной проверкой Stripe
+# bot.py (aiogram 2.25.2) — базовая версия + продление за 59 PLN
 import os
 import json
 import asyncio
+import time
 from datetime import datetime, timedelta
 
 from aiohttp import web
@@ -12,7 +13,7 @@ import stripe
 
 # -------- Конфиг из окружения --------
 API_TOKEN = os.getenv("API_TOKEN")
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")          # пример: https://your-domain.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")          # напр.: https://your-domain.com
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1279721354"))
 
@@ -20,23 +21,27 @@ STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 stripe.api_key = STRIPE_SECRET_KEY
 
-WEBHOOK_PATH = f"/webhook/{API_TOKEN}"            # путь Telegram вебхука
-STRIPE_WEBHOOK_PATH = "/webhook/stripe"           # путь Stripe вебхука
+WEBHOOK_PATH = f"/webhook/{API_TOKEN}"            # Telegram webhook path
+STRIPE_WEBHOOK_PATH = "/webhook/stripe"           # Stripe webhook path
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
-# username бота для редиректов из Stripe
+# username бота для тихого редиректа из Stripe
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = int(os.getenv("PORT", "8000"))
 
-DB_FILE = "/data/subscriptions.json"
+DB_FILE = "/data/subscriptions.json"  # база локальных подписок
+
+# Цены (в PLN)
+PRICE_INITIAL_PLN = 159      # твоя базовая цена (оставил как было)
+PRICE_RENEW_PLN   = 59     # продление
 
 # -------- Бот/диспетчер --------
 bot = Bot(token=API_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher(bot)
 
-# -------- Утилиты БД (совместимость со старым форматом) --------
+# -------- Утилиты БД (совм. со старым форматом) --------
 def _ensure_data_dir():
     d = os.path.dirname(DB_FILE)
     if d and not os.path.exists(d):
@@ -44,7 +49,7 @@ def _ensure_data_dir():
 
 def _empty_db():
     # subs: { user_id(str): "YYYY-MM-DD" }
-    # pending: { user_id(str): "cs_..." или {"id": "...", "ts": ...} }
+    # pending: { user_id(str): {"id": "cs_...", "ts": 123, "kind": "initial"|"renew"} }
     return {"subs": {}, "pending": {}}
 
 def load_db():
@@ -57,6 +62,7 @@ def load_db():
     except Exception:
         return _empty_db()
     if isinstance(data, dict) and "subs" not in data and "pending" not in data:
+        # старый формат: {user_id: "YYYY-MM-DD"}
         return {"subs": data, "pending": {}}
     return {"subs": dict(data.get("subs", {})), "pending": dict(data.get("pending", {}))}
 
@@ -74,54 +80,85 @@ def set_sub_end(user_id: int, end_date_str: str):
     db["subs"][str(user_id)] = end_date_str
     save_db(db)
 
-def set_pending_session(user_id: int, session_id: str):
-    db["pending"][str(user_id)] = session_id
+def set_pending_session(user_id: int, session_id: str, kind: str):
+    db["pending"][str(user_id)] = {"id": session_id, "ts": int(time.time()), "kind": kind}
     save_db(db)
 
-def pop_pending_session(user_id: int):
-    return db["pending"].pop(str(user_id), None) if str(user_id) in db["pending"] else None
-
 def peek_pending_session(user_id: int):
-    return db["pending"].get(str(user_id))
+    item = db["pending"].get(str(user_id))
+    if isinstance(item, str):
+        # совместимость на случай старого значения
+        return {"id": item, "ts": int(time.time()), "kind": "initial"}
+    return item
 
-# -------- Stripe: создание сессии оплаты --------
-async def create_checkout_session(user_id: int):
+def pop_pending_session(user_id: int):
+    db["pending"].pop(str(user_id), None)
+    save_db(db)
+
+# -------- Вспомогательное: вычислить новую дату окончания (+30 дней) --------
+def extend_30_days_from_current_or_today(current_end_str: str | None) -> str:
+    today = datetime.now().date()
+    base = today
+    if current_end_str:
+        try:
+            end_date = datetime.strptime(current_end_str, "%Y-%m-%d").date()
+            if end_date > base:
+                base = end_date
+        except Exception:
+            pass
+    new_end = base + timedelta(days=30)
+    return new_end.strftime("%Y-%m-%d")
+
+# -------- Stripe: создание сессии оплаты (любая сумма) --------
+def _success_url():
+    return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
+
+def _cancel_url():
+    return f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
+
+async def create_checkout_session(user_id: int, amount_pln: int, product_name: str, kind: str):
     try:
-        # ТИХИЙ редирект в чат бота (без /start и параметров)
-        success_url = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
-        cancel_url  = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else WEBHOOK_HOST
-
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
             line_items=[{
                 "price_data": {
                     "currency": "pln",
-                    "product_data": {"name": "Dostęp do kanału VIP"},
-                    "unit_amount": 500,  # 5 PLN
+                    "product_data": {"name": product_name},
+                    "unit_amount": amount_pln * 100,  # PLN -> grosz
                 },
                 "quantity": 1,
             }],
             mode="payment",
-            success_url=success_url,
-            cancel_url=cancel_url,
-            metadata={"user_id": str(user_id)},
+            success_url=_success_url(),
+            cancel_url=_cancel_url(),
+            metadata={"user_id": str(user_id), "kind": kind},
         )
-        # сохраним сессию, чтобы потом можно было вручную проверить
-        set_pending_session(user_id, session.id)
+        set_pending_session(user_id, session.id, kind)
         return session.url
     except Exception as e:
         print(f"[Stripe] create_checkout_session error: {e}")
         return None
 
-# -------- Команды / Кнопки --------
+# -------- Клавиатуры --------
 def main_keyboard() -> InlineKeyboardMarkup:
-    # Добавили третью кнопку "✅ Zapłaciłem"
     return InlineKeyboardMarkup(row_width=1).add(
         InlineKeyboardButton("📞 Kontakt z administratorem", url="https://t.me/wawaadmin"),
         InlineKeyboardButton("💳 Link do płatności", callback_data="pay"),
         InlineKeyboardButton("✅ Zapłaciłem", callback_data="paid"),
     )
 
+def renew_offer_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(row_width=2).add(
+        InlineKeyboardButton(f"🔄 Przedłuż za {PRICE_RENEW_PLN} PLN", callback_data="renew"),
+        InlineKeyboardButton("Nie przedłużaj", callback_data="norenew"),
+    )
+
+def paid_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(row_width=1).add(
+        InlineKeyboardButton("✅ Zapłaciłem", callback_data="paid")
+    )
+
+# -------- Команды --------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -138,10 +175,16 @@ async def cmd_start(message: types.Message):
             reply_markup=main_keyboard()
         )
 
+# -------- Первичная оплата --------
 @dp.callback_query_handler(lambda c: c.data == "pay")
 async def handle_payment(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    payment_url = await create_checkout_session(user_id)
+    payment_url = await create_checkout_session(
+        user_id,
+        PRICE_INITIAL_PLN,
+        "Dostęp do kanału VIP",
+        kind="initial"
+    )
     if payment_url:
         await callback.message.answer(
             "💳 Kliknij poniżej, aby przejść do płatności:",
@@ -150,21 +193,53 @@ async def handle_payment(callback: types.CallbackQuery):
             )
         )
         await callback.message.answer(
-            "Po opłaceniu, jeśli link nie przyszedł automatycznie, naciśnij „✅ Zapłaciłem”."
+            "Po opłaceniu, jeśli link nie przyszedł automatycznie, naciśnij „✅ Zapłaciłem”.",
+            reply_markup=paid_inline_keyboard()
         )
     else:
         await callback.message.answer("❌ Błąd podczas generowania linku do płatności.")
+    await callback.answer()
+
+# -------- Продление (кнопка из напоминания) --------
+@dp.callback_query_handler(lambda c: c.data == "renew")
+async def handle_renew(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    payment_url = await create_checkout_session(
+        user_id,
+        PRICE_RENEW_PLN,
+        "VIP_WAWA — przedłużenie 30 dni",
+        kind="renew"
+    )
+    if payment_url:
+        await callback.message.answer(
+            f"🔄 Przedłużenie VIP_WAWA za {PRICE_RENEW_PLN} PLN — kliknij, aby zapłacić:",
+            reply_markup=InlineKeyboardMarkup().add(
+                InlineKeyboardButton("🔗 Zapłać teraz", url=payment_url)
+            )
+        )
+        await callback.message.answer(
+            "Po opłaceniu naciśnij „✅ Zapłaciłem”, aby odebrać link.",
+            reply_markup=paid_inline_keyboard()
+        )
+    else:
+        await callback.message.answer("❌ Nie udało się wygenerować linku do przedłużenia.")
+    await callback.answer()
+
+@dp.callback_query_handler(lambda c: c.data == "norenew")
+async def handle_no_renew(callback: types.CallbackQuery):
+    await callback.message.answer("Rozumiem. Możesz wrócić do przedłużenia w dowolnym momencie z menu.")
     await callback.answer()
 
 # -------- Ручная проверка "Zapłaciłem" --------
 @dp.callback_query_handler(lambda c: c.data == "paid")
 async def handle_paid(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    session_id = peek_pending_session(user_id)
+    item = peek_pending_session(user_id)
+    session_id = item["id"] if item else None
 
     if not session_id:
         await callback.message.answer(
-            "Nie widzę aktywnej płatności. Najpierw użyj „💳 Link do płatności”.",
+            "Nie widzę aktywnej płatności. Najpierw użyj „💳 Link do płatności” lub „🔄 Przedłuż”.",
             reply_markup=main_keyboard()
         )
         await callback.answer()
@@ -178,9 +253,11 @@ async def handle_paid(callback: types.CallbackQuery):
         return
 
     if session.get("status") == "complete" and session.get("payment_status") == "paid":
-        end_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-        set_sub_end(user_id, end_date)
+        # продление/активация на 30 дней от текущей или сегодняшней даты
+        new_end = extend_30_days_from_current_or_today(get_sub_end(user_id))
+        set_sub_end(user_id, new_end)
         pop_pending_session(user_id)
+
         try:
             invite = await bot.create_chat_invite_link(
                 chat_id=CHANNEL_ID,
@@ -190,7 +267,12 @@ async def handle_paid(callback: types.CallbackQuery):
             kb = InlineKeyboardMarkup().add(
                 InlineKeyboardButton("🔗 Dołącz do kanału", url=invite.invite_link)
             )
-            await callback.message.answer("✅ Płatność potwierdzona! Oto link:", reply_markup=kb)
+            await callback.message.answer(
+                "✅ Płatność potwierdzona! Twoja subskrypcja została przedłużona o 30 dni.\n"
+                f"📅 Nowa data końca: <b>{new_end}</b>\n"
+                "Kliknij, aby dołączyć:",
+                reply_markup=kb
+            )
         except Exception as e:
             await bot.send_message(
                 ADMIN_ID,
@@ -204,7 +286,7 @@ async def handle_paid(callback: types.CallbackQuery):
 
     await callback.answer()
 
-# -------- Stripe вебхук (автоматический путь) --------
+# -------- Stripe webhook (автоматический путь) --------
 async def stripe_webhook(request: web.Request):
     payload = await request.read()
     sig_header = request.headers.get("Stripe-Signature")
@@ -218,13 +300,19 @@ async def stripe_webhook(request: web.Request):
         session = event["data"]["object"]
         user_id = session.get("metadata", {}).get("user_id")
         if user_id:
-            end_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
-            set_sub_end(int(user_id), end_date)
+            user_id_int = int(user_id)
+            # продлеваем от текущей даты окончания или от сегодня
+            new_end = extend_30_days_from_current_or_today(get_sub_end(user_id_int))
+            set_sub_end(user_id_int, new_end)
+
+            # если pending совпадает — чистим
             try:
-                if peek_pending_session(int(user_id)) == session.get("id"):
-                    pop_pending_session(int(user_id))
+                item = peek_pending_session(user_id_int)
+                if item and item.get("id") == session.get("id"):
+                    pop_pending_session(user_id_int)
             except Exception:
                 pass
+
             try:
                 invite = await bot.create_chat_invite_link(
                     chat_id=CHANNEL_ID,
@@ -235,8 +323,10 @@ async def stripe_webhook(request: web.Request):
                     InlineKeyboardButton("🔗 Dołącz do kanału", url=invite.invite_link)
                 )
                 await bot.send_message(
-                    int(user_id),
-                    "✅ Płatność potwierdzona! Kliknij poniżej, aby dołączyć do kanału:",
+                    user_id_int,
+                    "✅ Płatność potwierdzona! Twoja subskrypcja została przedłużona o 30 dni.\n"
+                    f"📅 Nowa data końca: <b>{new_end}</b>\n"
+                    "Kliknij, aby dołączyć:",
                     reply_markup=kb
                 )
             except Exception as e:
@@ -247,7 +337,7 @@ async def stripe_webhook(request: web.Request):
 
     return web.Response(status=200)
 
-# -------- Периодическая проверка подписок --------
+# -------- Напоминалки и автокик --------
 async def check_expired():
     already_notified = set()
     while True:
@@ -258,10 +348,17 @@ async def check_expired():
             try:
                 end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
 
+                # Напоминание за день до конца (с кнопками продления)
                 if end_date == now + timedelta(days=1) and user_id not in already_notified:
-                    await bot.send_message(int(user_id), "⏳ Twoja subskrypcja kończy się jutro!")
+                    await bot.send_message(
+                        int(user_id),
+                        "⏳ Twoja subskrypcja <b>VIP_WAWA</b> kończy się jutro.\n"
+                        f"Możesz przedłużyć ją teraz za <b>{PRICE_RENEW_PLN} PLN</b>.",
+                        reply_markup=renew_offer_keyboard()
+                    )
                     already_notified.add(user_id)
 
+                # Истёк срок — сообщение + удаление
                 elif end_date <= now:
                     try:
                         await bot.send_message(int(user_id), "❌ Twoja subskrypcja wygasła. Zostałeś usunięty z kanału.")
@@ -274,6 +371,7 @@ async def check_expired():
                     except Exception as e:
                         await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy usuwaniu {user_id}:\n<code>{e}</code>")
                     to_remove.append(user_id)
+
             except Exception as e:
                 await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy przetwarzaniu {user_id}:\n<code>{e}</code>")
 
