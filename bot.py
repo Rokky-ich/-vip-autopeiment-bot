@@ -1,6 +1,6 @@
 # bot.py (aiogram 2.25.2)
 # база + продление 59 PLN + "уже подписан" + авто-чистка pending + санитарка pending
-# + уведомления админу + постоянная клавиатура с кнопкой /start
+# + уведомления админу + постоянная клавиатура с кнопкой 🚀START (работает как /start)
 import os
 import json
 import asyncio
@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton  # 👈 добавили
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 import stripe
 
@@ -272,7 +272,7 @@ async def create_checkout_session(user_id: int, amount_pln: int, product_name: s
 
 # -------- Клавиатуры --------
 def reply_persistent_kb() -> ReplyKeyboardMarkup:
-    """Постоянная клавиатура внизу чата: кнопка отправляет /start за один тап."""
+    """Постоянная клавиатура внизу чата: кнопка отправляет 🚀START (мы перехватываем и обрабатываем как /start)."""
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
     kb.add(KeyboardButton("🚀START"))
     return kb
@@ -295,7 +295,7 @@ def paid_inline_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Zapłaciłem", callback_data="paid")
     )
 
-# -------- Команда /start --------
+# -------- /start и алиасы для кнопки 🚀START --------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -304,7 +304,7 @@ async def cmd_start(message: types.Message):
         await message.answer(
             "👋 Cześć! Widzę, że masz rozpoczętą płatność.\n"
             "Jeśli już opłaciłeś, naciśnij „✅ Zapłaciłem”.",
-            reply_markup=reply_persistent_kb()  # 👈 устанавливаем постоянную клавиатуру
+            reply_markup=reply_persistent_kb()
         )
         await message.answer(
             "👇 Wybierz działanie:",
@@ -313,12 +313,25 @@ async def cmd_start(message: types.Message):
     else:
         await message.answer(
             "👋 Cześć! Kliknij przyciski poniżej:",
-            reply_markup=reply_persistent_kb()  # 👈 устанавливаем постоянную клавиатуру
+            reply_markup=reply_persistent_kb()
         )
         await message.answer(
             "👇 Menu:",
             reply_markup=main_keyboard()
         )
+
+def _is_start_btn_text(text: str) -> bool:
+    """Нормализуем текст и считаем 🚀START / START как /start."""
+    if not text:
+        return False
+    t = text.strip().lower()
+    t = t.replace("🚀", "").strip()
+    return t in {"start", "/start"}
+
+@dp.message_handler(lambda m: _is_start_btn_text(m.text))
+async def start_button_alias(message: types.Message):
+    # Нажали на кнопку 🚀START в reply-клавиатуре — выполняем ту же логику, что и /start
+    await cmd_start(message)
 
 # -------- Первичная оплата / с проверкой активной подписки --------
 @dp.callback_query_handler(lambda c: c.data == "pay")
@@ -448,12 +461,12 @@ async def handle_paid(callback: types.CallbackQuery):
                 ADMIN_ID,
                 f"⚠️ Błąd przy wysyłaniu linku użytkownikowi {user_id}:\n<code>{e}</code>"
             )
-            await callback.message.answer("⚠️ Wystąpił błąd po stronie bота. Admin został powiadomiony.")
+            await callback.message.answer("⚠️ Wystąpił błąd po stronie бота. Admin został powiadomiony.")
     else:
         if is_active:
             await callback.message.answer(
                 "🔎 Płatność jeszcze niepotwierdzona.\n"
-                f"✅ Masz aktywną subskrypcję do <b>{end_date.strftime('%Y-%m-%d')}</b> "
+                f"✅ Masz aktywną субскрыпцию до <b>{end_date.strftime('%Y-%m-%d')}</b> "
                 f"(pozostało dni: <b>{days_left}</b>).\n"
                 "Jeśli zapłaciłeś, odczekaj chwilę i нaciśnij ponownie „✅ Zapłaciłem”."
             )
@@ -553,7 +566,7 @@ async def check_expired():
                     to_remove.append(user_id)
 
             except Exception as e:
-                await bot.send_message(ADMIN_ID, f"⚠️ Błąd при przetwarzaniu {user_id}:\n<code>{e}</code>")
+                await bot.send_message(ADMIN_ID, f"⚠️ Błąd przy przetwarzaniu {user_id}:\n<code>{e}</code>")
 
         for uid in to_remove:
             db["subs"].pop(uid, None)
