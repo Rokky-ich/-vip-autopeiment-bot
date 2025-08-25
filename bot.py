@@ -274,7 +274,7 @@ async def create_checkout_session(user_id: int, amount_pln: int, product_name: s
 def reply_persistent_kb() -> ReplyKeyboardMarkup:
     """Постоянная клавиатура внизу чата: кнопка отправляет /start за один тап."""
     kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=False)
-    kb.add(KeyboardButton("/start"))
+    kb.add(KeyboardButton("🚀START"))
     return kb
 
 def main_keyboard() -> InlineKeyboardMarkup:
