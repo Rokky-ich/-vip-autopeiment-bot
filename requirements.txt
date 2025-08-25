@@ -1,3 +1,5 @@
 aiogram==2.25.2
-aiohttp==3.8.6
+aiohttp
 python-telegram-bot==20.7
+stripe==8.6.0
+requests==2.32.3
